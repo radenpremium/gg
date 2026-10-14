@@ -1,7 +1,7 @@
 --[[
     AUTO TELEPORT MOB v3
     Alur:
-      Tab kiri: Auto Farm (teleport mob) | Game Mode (Auto Dungeon + Auto Mob Dungeon) | Misc (Anti AFK)
+      Tab kiri: Auto Farm (teleport mob) | Game Mode (Auto Dungeon + Auto Mob + Auto Leave) | Misc (Anti AFK)
       1. Klik "Scan Mob"  -> semua nama mob di workspace.World1.Enemy (nama kembar dijadikan 1)
       2. Dropdown 1       -> pilih 1 mob, berdiri di tempat yang diinginkan, klik "Save Posisi"
                              (boleh save berkali-kali untuk mob yang sama = banyak posisi, urut 1, 2, 3, ...)
@@ -1235,6 +1235,8 @@ local END_WORDS = { "end", "finish", "complete", "over", "result", "win", "lose"
 -- PENGATURAN AUTO MOB DUNGEON (mob ada di workspace.<model>.Enemy)
 local DUNGEON_MOB_OFFSET = Vector3.new(0, 0, 3) -- posisi berdiri relatif terhadap mob
 local DUNGEON_FOLLOW_DISTANCE = 10              -- kalau mob bergerak lebih jauh dari ini, teleport lagi mengikuti mob
+local LEAVE_RETRY = 5                       -- detik jeda sebelum mencoba keluar lagi kalau masih di dalam dungeon
+local LEAVE_MIN_INSIDE = 3                  -- detik minimal di dalam dungeon sebelum auto leave boleh jalan
 local DUNGEON_MOB_TIMEOUT = 20                  -- detik tanpa HP mob berubah -> lewati mob itu sementara (15 dtk)
 
 local dungeon = {
@@ -1263,11 +1265,13 @@ local dungeon = {
 }
 local roomInfo = { inside = nil, found = false, t = 0 }
 local answerRemote = nil
+local leaveRemote = nil
 local dungeonReady = false
 local dungeonFailed = false
 local dungeonConns = {}
 local ddDungeon -- dropdown difficulty (dibuat di bawah)
 local dungeonMob = { enabled = false, running = false, token = 0, status = "" }
+local leaveCfg = { enabled = false, lastFire = 0, insideSince = nil, status = "", box = nil }
 
 local function serverNow()
     return workspace:GetServerTimeNow()
@@ -1472,6 +1476,7 @@ task.spawn(function()
     if not folder then dungeonFailed = true return end
 
     answerRemote = folder:FindFirstChild("Answer")
+    leaveRemote = folder:FindFirstChild("Leave")
     local promptR = folder:FindFirstChild("Prompt")
     local startR = folder:FindFirstChild("Start")
     if not (answerRemote and promptR) then dungeonFailed = true return end
@@ -1481,7 +1486,7 @@ task.spawn(function()
         table.insert(dungeonConns, startR.OnClientEvent:Connect(onStart))
     end
     for _, r in ipairs(folder:GetChildren()) do
-        if r:IsA("RemoteEvent") and r ~= promptR and r ~= startR and r ~= answerRemote then
+        if r:IsA("RemoteEvent") and r ~= promptR and r ~= startR and r ~= answerRemote and r ~= leaveRemote then
             table.insert(dungeonConns, r.OnClientEvent:Connect(function()
                 onOtherEvent(r.Name)
             end))
@@ -1585,6 +1590,66 @@ local function startDungeonMobLoop()
 end
 
 ----------------------------------------------------------------
+-- AUTO LEAVE DUNGEON (keluar saat mencapai wave yang ditentukan)
+----------------------------------------------------------------
+-- Baca wave dari PlayerGui.RaidHUD.TopHolder.Wave.Amount (teks "20/50"). Mengembalikan: wave sekarang, wave maksimal
+local function getWaveInfo()
+    local pg = player:FindFirstChild("PlayerGui")
+    local hud = pg and pg:FindFirstChild("RaidHUD")
+    local top = hud and hud:FindFirstChild("TopHolder")
+    local wave = top and top:FindFirstChild("Wave")
+    local amount = wave and wave:FindFirstChild("Amount")
+    if not (amount and amount:IsA("TextLabel")) then return nil end
+
+    -- HUD harus sedang tampil (supaya tidak membaca angka sisa dari dungeon sebelumnya)
+    local obj = amount
+    while obj and obj ~= pg do
+        if obj:IsA("GuiObject") and not obj.Visible then return nil end
+        if obj:IsA("ScreenGui") and not obj.Enabled then return nil end
+        obj = obj.Parent
+    end
+
+    local cur, max = string.match(amount.Text, "(%d+)%s*/%s*(%d+)")
+    if not cur then
+        cur = string.match(amount.Text, "(%d+)")
+    end
+    return tonumber(cur), tonumber(max)
+end
+
+local function leaveTick(t, inDungeon)
+    if not inDungeon then
+        leaveCfg.insideSince = nil
+        leaveCfg.status = ""
+        return
+    end
+    leaveCfg.insideSince = leaveCfg.insideSince or t
+    if not leaveCfg.enabled then return end
+
+    local target = leaveCfg.box and tonumber(leaveCfg.box.Text)
+    if not target or target < 1 then
+        leaveCfg.status = "isi angka wave dulu"
+        return
+    end
+
+    local cur, max = getWaveInfo()
+    if not cur then
+        leaveCfg.status = "membaca wave..."
+        return
+    end
+
+    leaveCfg.status = string.format("wave %d/%s, keluar di wave %d", cur, max and tostring(max) or "?", target)
+
+    if cur >= target
+        and t - leaveCfg.insideSince >= LEAVE_MIN_INSIDE
+        and os.clock() - leaveCfg.lastFire >= LEAVE_RETRY
+        and leaveRemote then
+        leaveCfg.lastFire = os.clock()
+        pcall(function() leaveRemote:FireServer() end)
+        leaveCfg.status = string.format("wave %d tercapai, keluar dari dungeon...", cur)
+    end
+end
+
+----------------------------------------------------------------
 -- UI tab Game Mode
 ----------------------------------------------------------------
 local function mkLabel(parent, text, x, y, w, h, size, color, font)
@@ -1616,8 +1681,8 @@ end
 
 -- Checkbox Auto Join Dungeon
 local djRow = Instance.new("Frame")
-djRow.Size = UDim2.new(1, -16, 0, 56)
-djRow.Position = UDim2.new(0, 8, 0, 86)
+djRow.Size = UDim2.new(1, -16, 0, 44)
+djRow.Position = UDim2.new(0, 8, 0, 82)
 djRow.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
 djRow.BorderSizePixel = 0
 djRow.Parent = pageGame
@@ -1640,8 +1705,8 @@ djStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 djStroke.Color = Color3.fromRGB(110, 110, 125)
 djStroke.Parent = djBox
 
-mkLabel(djRow, "Auto Join Dungeon", 52, 8, 250, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
-mkLabel(djRow, "Join otomatis tiap dungeon dibuka", 52, 29, 250, 18, 11, Color3.fromRGB(150, 150, 165))
+mkLabel(djRow, "Auto Join Dungeon", 52, 5, 250, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+mkLabel(djRow, "Join otomatis tiap dungeon dibuka", 52, 24, 250, 18, 11, Color3.fromRGB(150, 150, 165))
 
 local function refreshDjBox()
     if dungeon.enabled then
@@ -1662,23 +1727,23 @@ end)
 
 -- Panel info
 local infoFrame = Instance.new("Frame")
-infoFrame.Size = UDim2.new(1, -16, 0, 176)
-infoFrame.Position = UDim2.new(0, 8, 0, 152)
+infoFrame.Size = UDim2.new(1, -16, 0, 144)
+infoFrame.Position = UDim2.new(0, 8, 0, 132)
 infoFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
 infoFrame.BorderSizePixel = 0
 infoFrame.Parent = pageGame
 Instance.new("UICorner", infoFrame).CornerRadius = UDim.new(0, 8)
 
-mkLabel(infoFrame, "Dungeon berikutnya dibuka dalam", 12, 8, 300, 14, 11, Color3.fromRGB(170, 170, 185))
-local lblCount = mkLabel(infoFrame, "--:--", 12, 24, 300, 30, 26, Color3.fromRGB(255, 231, 59), Enum.Font.GothamBold)
-local lblSub = mkLabel(infoFrame, "", 12, 58, 300, 16, 11, Color3.fromRGB(170, 170, 185))
-local lblState = mkLabel(infoFrame, "", 12, 82, 300, 40, 12, Color3.fromRGB(230, 230, 240))
-local lblDebug = mkLabel(infoFrame, "", 12, 128, 300, 44, 10, Color3.fromRGB(130, 130, 145), Enum.Font.Code)
+mkLabel(infoFrame, "Dungeon berikutnya dibuka dalam", 12, 6, 300, 14, 11, Color3.fromRGB(170, 170, 185))
+local lblCount = mkLabel(infoFrame, "--:--", 12, 20, 300, 30, 24, Color3.fromRGB(255, 231, 59), Enum.Font.GothamBold)
+local lblSub = mkLabel(infoFrame, "", 12, 52, 300, 16, 11, Color3.fromRGB(170, 170, 185))
+local lblState = mkLabel(infoFrame, "", 12, 68, 300, 40, 11, Color3.fromRGB(230, 230, 240))
+local lblDebug = mkLabel(infoFrame, "", 12, 110, 300, 30, 10, Color3.fromRGB(130, 130, 145), Enum.Font.Code)
 
 -- Checkbox Auto Mob Dungeon
 local dmRow = Instance.new("Frame")
-dmRow.Size = UDim2.new(1, -16, 0, 56)
-dmRow.Position = UDim2.new(0, 8, 0, 336)
+dmRow.Size = UDim2.new(1, -16, 0, 44)
+dmRow.Position = UDim2.new(0, 8, 0, 282)
 dmRow.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
 dmRow.BorderSizePixel = 0
 dmRow.Parent = pageGame
@@ -1701,10 +1766,80 @@ dmStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 dmStroke.Color = Color3.fromRGB(110, 110, 125)
 dmStroke.Parent = dmBox
 
-mkLabel(dmRow, "Auto Mob Dungeon", 52, 8, 250, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
-mkLabel(dmRow, "Aktif hanya saat di dalam dungeon", 52, 29, 250, 18, 11, Color3.fromRGB(150, 150, 165))
+mkLabel(dmRow, "Auto Mob Dungeon", 52, 5, 250, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+mkLabel(dmRow, "Aktif hanya saat di dalam dungeon", 52, 24, 250, 18, 11, Color3.fromRGB(150, 150, 165))
 
-local lblMobStatus = mkLabel(pageGame, "", 8, 398, 324, 30, 11, Color3.fromRGB(200, 200, 210))
+local lblMobStatus = mkLabel(pageGame, "", 8, 382, 324, 16, 11, Color3.fromRGB(200, 200, 210))
+local lblLeaveStatus = mkLabel(pageGame, "", 8, 400, 324, 30, 11, Color3.fromRGB(200, 200, 210))
+
+-- Checkbox Auto Leave Dungeon + input wave
+do
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 44)
+    row.Position = UDim2.new(0, 8, 0, 332)
+    row.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+    row.BorderSizePixel = 0
+    row.Parent = pageGame
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+    local box = Instance.new("TextButton")
+    box.Size = UDim2.new(0, 28, 0, 28)
+    box.Position = UDim2.new(0, 12, 0.5, -14)
+    box.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    box.Text = ""
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.GothamBold
+    box.TextSize = 18
+    box.AutoButtonColor = false
+    box.Parent = row
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 2
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Color = Color3.fromRGB(110, 110, 125)
+    stroke.Parent = box
+
+    mkLabel(row, "Auto Leave Dungeon", 52, 5, 170, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+    mkLabel(row, "Keluar saat mencapai wave", 52, 24, 170, 18, 11, Color3.fromRGB(150, 150, 165))
+
+    local waveBox = Instance.new("TextBox")
+    waveBox.Size = UDim2.new(0, 84, 0, 28)
+    waveBox.Position = UDim2.new(1, -96, 0.5, -14)
+    waveBox.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    waveBox.Text = ""
+    waveBox.PlaceholderText = "wave ke-"
+    waveBox.PlaceholderColor3 = Color3.fromRGB(110, 110, 125)
+    waveBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    waveBox.Font = Enum.Font.GothamBold
+    waveBox.TextSize = 13
+    waveBox.ClearTextOnFocus = false
+    waveBox.Parent = row
+    Instance.new("UICorner", waveBox).CornerRadius = UDim.new(0, 6)
+    leaveCfg.box = waveBox
+
+    -- hanya boleh angka
+    waveBox:GetPropertyChangedSignal("Text"):Connect(function()
+        local clean = waveBox.Text:gsub("%D", "")
+        if clean ~= waveBox.Text then waveBox.Text = clean end
+    end)
+
+    local function refresh()
+        if leaveCfg.enabled then
+            box.Text = "✔"
+            box.BackgroundColor3 = Color3.fromRGB(50, 170, 90)
+            stroke.Color = Color3.fromRGB(50, 170, 90)
+        else
+            box.Text = ""
+            box.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+            stroke.Color = Color3.fromRGB(110, 110, 125)
+        end
+    end
+
+    box.MouseButton1Click:Connect(function()
+        leaveCfg.enabled = not leaveCfg.enabled
+        refresh()
+    end)
+end
 
 local function refreshDmBox()
     if dungeonMob.enabled then
@@ -1848,6 +1983,8 @@ local function dungeonTick()
         stopDungeonMobLoop()
     end
 
+    leaveTick(t, inDungeon)
+
     -- ===== info UI =====
     local openNow = sinceOpen < JOIN_WINDOW
     if openNow then
@@ -1887,6 +2024,14 @@ local function dungeonTick()
         lblMobStatus.Text = "Auto Mob Dungeon: " .. dungeonMob.status
     else
         lblMobStatus.Text = "Auto Mob Dungeon: menunggu masuk dungeon"
+    end
+
+    if not leaveCfg.enabled then
+        lblLeaveStatus.Text = "Auto Leave: nonaktif"
+    elseif leaveCfg.status ~= "" then
+        lblLeaveStatus.Text = "Auto Leave: " .. leaveCfg.status
+    else
+        lblLeaveStatus.Text = "Auto Leave: menunggu masuk dungeon"
     end
 
     local roomStr
