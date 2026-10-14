@@ -1,7 +1,7 @@
 --[[
     AUTO TELEPORT MOB v3
     Alur:
-      Tab kiri: Auto Farm (teleport mob) | Game Mode (Auto Dungeon) | Misc (Anti AFK)
+      Tab kiri: Auto Farm (teleport mob) | Game Mode (Auto Dungeon + Auto Mob Dungeon) | Misc (Anti AFK)
       1. Klik "Scan Mob"  -> semua nama mob di workspace.World1.Enemy (nama kembar dijadikan 1)
       2. Dropdown 1       -> pilih 1 mob, berdiri di tempat yang diinginkan, klik "Save Posisi"
                              (boleh save berkali-kali untuk mob yang sama = banyak posisi, urut 1, 2, 3, ...)
@@ -1232,6 +1232,11 @@ local DUNGEON_ROOM_MARGIN = 60      -- toleransi (stud) di sekitar room dungeon 
 local DUNGEON_AWAY_DISTANCE = 300   -- pindah sejauh ini dari posisi awal = dianggap sudah masuk dungeon
 local END_WORDS = { "end", "finish", "complete", "over", "result", "win", "lose", "fail", "exit", "leave" }
 
+-- PENGATURAN AUTO MOB DUNGEON (mob ada di workspace.<model>.Enemy)
+local DUNGEON_MOB_OFFSET = Vector3.new(0, 0, 3) -- posisi berdiri relatif terhadap mob
+local DUNGEON_FOLLOW_DISTANCE = 10              -- kalau mob bergerak lebih jauh dari ini, teleport lagi mengikuti mob
+local DUNGEON_MOB_TIMEOUT = 20                  -- detik tanpa HP mob berubah -> lewati mob itu sementara (15 dtk)
+
 local dungeon = {
     enabled = false,
     phase = "idle",        -- idle | joining | inside
@@ -1253,6 +1258,8 @@ local dungeon = {
     offset = DUNGEON_OFFSET_SEC,
     note = "",
     err = nil,
+    manual = false,        -- true = terdeteksi di dalam dungeon tanpa lewat auto join
+    manualOutside = nil,
 }
 local roomInfo = { inside = nil, found = false, t = 0 }
 local answerRemote = nil
@@ -1260,6 +1267,7 @@ local dungeonReady = false
 local dungeonFailed = false
 local dungeonConns = {}
 local ddDungeon -- dropdown difficulty (dibuat di bawah)
+local dungeonMob = { enabled = false, running = false, token = 0, status = "" }
 
 local function serverNow()
     return workspace:GetServerTimeNow()
@@ -1483,6 +1491,100 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------------------
+-- AUTO MOB DUNGEON (teleport ke tiap mob di dalam dungeon, pindah setelah HP 0)
+----------------------------------------------------------------
+local function getDungeonMobFolder(d)
+    local dm = workspace:FindFirstChild(d.model)
+    return dm and dm:FindFirstChild("Enemy")
+end
+
+-- Pilih mob hidup terdekat yang tidak sedang dilewati. Mengembalikan: mob, jumlah mob hidup
+local function pickDungeonMob(d, skip)
+    local folder = getDungeonMobFolder(d)
+    local root = getRoot()
+    if not folder or not root then return nil, 0 end
+
+    local best, bestDist, count = nil, math.huge, 0
+    local now = os.clock()
+    for _, m in ipairs(folder:GetDescendants()) do
+        if m:IsA("Model") and (m.Parent == folder or m:FindFirstChildOfClass("Humanoid")) and isAlive(m) then
+            count += 1
+            if not (skip[m] and skip[m] > now) then
+                local ok, pos = pcall(function() return m:GetPivot().Position end)
+                if ok then
+                    local dist = (pos - root.Position).Magnitude
+                    if dist < bestDist then best, bestDist = m, dist end
+                end
+            end
+        end
+    end
+    return best, count
+end
+
+local function stopDungeonMobLoop()
+    dungeonMob.running = false
+    dungeonMob.token += 1
+end
+
+local function startDungeonMobLoop()
+    if dungeonMob.running then return end
+    dungeonMob.running = true
+    dungeonMob.token += 1
+    local my = dungeonMob.token
+
+    local function valid()
+        return dungeonMob.running and dungeonMob.token == my
+    end
+
+    task.spawn(function()
+        local skip = {} -- [mob] = waktu (os.clock) sampai kapan dilewati
+
+        while valid() do
+            local d = getSelectedDungeon()
+            local target, count = pickDungeonMob(d, skip)
+
+            if not target then
+                dungeonMob.status = (count > 0) and "mob tersisa sedang dilewati sementara..." or "menunggu mob muncul..."
+                RunService.Heartbeat:Wait()
+            else
+                local lastHP = readHP(target)
+                local lastChange = os.clock()
+                local first = true
+
+                -- tetap di mob ini sampai HP 0 / hilang, baru pindah ke mob lain
+                while valid() and target.Parent and isAlive(target) do
+                    local root = getRoot()
+                    if root then
+                        local ok, mobCF = pcall(function() return target:GetPivot() end)
+                        if ok then
+                            local pos = mobCF.Position
+                            if first or (root.Position - pos).Magnitude > DUNGEON_FOLLOW_DISTANCE then
+                                root.CFrame = CFrame.new(pos + DUNGEON_MOB_OFFSET)
+                                first = false
+                            end
+                        end
+                    end
+
+                    -- macet: HP tidak berubah terlalu lama -> lewati mob ini sementara
+                    local hp = readHP(target)
+                    if hp ~= lastHP then
+                        lastHP = hp
+                        lastChange = os.clock()
+                    end
+                    if os.clock() - lastChange > DUNGEON_MOB_TIMEOUT then
+                        skip[target] = os.clock() + 15
+                        break
+                    end
+
+                    dungeonMob.status = "menyerang " .. target.Name
+                    RunService.Heartbeat:Wait()
+                end
+            end
+        end
+    end)
+end
+
+----------------------------------------------------------------
 -- UI tab Game Mode
 ----------------------------------------------------------------
 local function mkLabel(parent, text, x, y, w, h, size, color, font)
@@ -1573,6 +1675,55 @@ local lblSub = mkLabel(infoFrame, "", 12, 58, 300, 16, 11, Color3.fromRGB(170, 1
 local lblState = mkLabel(infoFrame, "", 12, 82, 300, 40, 12, Color3.fromRGB(230, 230, 240))
 local lblDebug = mkLabel(infoFrame, "", 12, 128, 300, 44, 10, Color3.fromRGB(130, 130, 145), Enum.Font.Code)
 
+-- Checkbox Auto Mob Dungeon
+local dmRow = Instance.new("Frame")
+dmRow.Size = UDim2.new(1, -16, 0, 56)
+dmRow.Position = UDim2.new(0, 8, 0, 336)
+dmRow.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+dmRow.BorderSizePixel = 0
+dmRow.Parent = pageGame
+Instance.new("UICorner", dmRow).CornerRadius = UDim.new(0, 8)
+
+local dmBox = Instance.new("TextButton")
+dmBox.Size = UDim2.new(0, 28, 0, 28)
+dmBox.Position = UDim2.new(0, 12, 0.5, -14)
+dmBox.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+dmBox.Text = ""
+dmBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+dmBox.Font = Enum.Font.GothamBold
+dmBox.TextSize = 18
+dmBox.AutoButtonColor = false
+dmBox.Parent = dmRow
+Instance.new("UICorner", dmBox).CornerRadius = UDim.new(0, 6)
+local dmStroke = Instance.new("UIStroke")
+dmStroke.Thickness = 2
+dmStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+dmStroke.Color = Color3.fromRGB(110, 110, 125)
+dmStroke.Parent = dmBox
+
+mkLabel(dmRow, "Auto Mob Dungeon", 52, 8, 250, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+mkLabel(dmRow, "Aktif hanya saat di dalam dungeon", 52, 29, 250, 18, 11, Color3.fromRGB(150, 150, 165))
+
+local lblMobStatus = mkLabel(pageGame, "", 8, 398, 324, 30, 11, Color3.fromRGB(200, 200, 210))
+
+local function refreshDmBox()
+    if dungeonMob.enabled then
+        dmBox.Text = "✔"
+        dmBox.BackgroundColor3 = Color3.fromRGB(50, 170, 90)
+        dmStroke.Color = Color3.fromRGB(50, 170, 90)
+    else
+        dmBox.Text = ""
+        dmBox.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+        dmStroke.Color = Color3.fromRGB(110, 110, 125)
+    end
+end
+
+dmBox.MouseButton1Click:Connect(function()
+    dungeonMob.enabled = not dungeonMob.enabled
+    if not dungeonMob.enabled then stopDungeonMobLoop() end
+    refreshDmBox()
+end)
+
 ----------------------------------------------------------------
 -- Pengendali auto dungeon (jalan tiap 0.25 detik)
 ----------------------------------------------------------------
@@ -1586,8 +1737,35 @@ local function dungeonTick()
 
     -- ===== kontrol =====
     if not dungeon.enabled then
-        if dungeon.phase ~= "idle" or dungeonLock then dungeonReset() end
+        if dungeon.phase ~= "idle" or (dungeonLock and not dungeon.manual) then dungeonReset() end
+
+        -- Auto Mob Dungeon menyala tapi Auto Join mati: tetap deteksi kalau kamu masuk dungeon manual
+        if dungeonMob.enabled then
+            if os.clock() - roomInfo.t >= 0.5 then refreshRoom(d) end
+            if roomInfo.inside == true then
+                dungeon.manualOutside = nil
+                if not dungeon.manual then
+                    dungeon.manual = true
+                    pauseFarmForDungeon()
+                end
+            elseif dungeon.manual then
+                dungeon.manualOutside = dungeon.manualOutside or t
+                if t - dungeon.manualOutside >= 3 then
+                    dungeon.manual = false
+                    dungeon.manualOutside = nil
+                    resumeFarmAfterDungeon()
+                end
+            end
+        elseif dungeon.manual then
+            dungeon.manual = false
+            dungeon.manualOutside = nil
+            resumeFarmAfterDungeon()
+        end
     elseif dungeonReady then
+        if dungeon.manual then
+            dungeon.manual = false
+            dungeon.manualOutside = nil
+        end
         if dungeon.phase ~= "idle" and os.clock() - roomInfo.t >= 0.5 then
             refreshRoom(d)
         end
@@ -1662,6 +1840,14 @@ local function dungeonTick()
         end
     end
 
+    -- ===== auto mob dungeon: hanya jalan saat di dalam dungeon =====
+    local inDungeon = (dungeon.phase == "inside") or dungeon.manual
+    if dungeonMob.enabled and inDungeon then
+        if not dungeonMob.running then startDungeonMobLoop() end
+    elseif dungeonMob.running then
+        stopDungeonMobLoop()
+    end
+
     -- ===== info UI =====
     local openNow = sinceOpen < JOIN_WINDOW
     if openNow then
@@ -1695,6 +1881,14 @@ local function dungeonTick()
     end
     lblState.Text = stateText
 
+    if not dungeonMob.enabled then
+        lblMobStatus.Text = "Auto Mob Dungeon: nonaktif"
+    elseif dungeonMob.running then
+        lblMobStatus.Text = "Auto Mob Dungeon: " .. dungeonMob.status
+    else
+        lblMobStatus.Text = "Auto Mob Dungeon: menunggu masuk dungeon"
+    end
+
     local roomStr
     if dungeon.phase == "idle" then
         roomStr = "-"
@@ -1719,6 +1913,9 @@ end)
 -- Bersihkan semua proses kalau GUI ditutup / dijalankan ulang
 gui.Destroying:Connect(function()
     dungeon.enabled = false
+    dungeonMob.enabled = false
+    dungeonMob.running = false
+    dungeonMob.token += 1
     for _, c in ipairs(dungeonConns) do c:Disconnect() end
     running = false
     runToken += 1
