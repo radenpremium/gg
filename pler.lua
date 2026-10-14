@@ -1,7 +1,7 @@
 --[[
     AUTO TELEPORT MOB v3
     Alur:
-      Tab kiri: Auto Farm (teleport mob) | Game Mode (Auto Dungeon + Auto Mob + Auto Leave) | Misc (Anti AFK)
+      Tab kiri: Auto Farm (teleport mob + Auto Godly Boss) | Game Mode (Auto Dungeon + Auto Mob + Auto Leave) | Misc (Anti AFK)
       1. Klik "Scan Mob"  -> semua nama mob di workspace.World1.Enemy (nama kembar dijadikan 1)
       2. Dropdown 1       -> pilih 1 mob, berdiri di tempat yang diinginkan, klik "Save Posisi"
                              (boleh save berkali-kali untuk mob yang sama = banyak posisi, urut 1, 2, 3, ...)
@@ -15,6 +15,75 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
+
+-- ===== Godly boss: state & pembantu dunia (fungsi lain diisi di bagian bawah script) =====
+local boss = {
+    enabled = false,     -- checkbox Auto Godly Boss
+    active = false,      -- true selama perjalanan godly boss berlangsung (Auto Farm ditahan)
+    token = 0,
+    pending = {},        -- [namaBoss] = waktu pengumuman (os.clock)
+    defeated = {},       -- [namaBoss] = waktu pengumuman "has been defeated"
+    seen = {},           -- cegah pengumuman kembar (chat + banner)
+    status = "",
+    noteUntil = 0,
+    savedPos = {},       -- posisi spawn boss yang disimpan lewat tombol di GUI: [World] = Vector3
+    list = {},           -- daftar godly boss {name, world, display, label}
+    byName = {},
+    byLabel = {},
+    dd = nil,            -- dropdown godly boss
+    lbl = nil,           -- label status
+    mods = {},           -- cache require modul game
+    failAt = {},
+    cfg = {
+        -- Koordinat spawn godly boss tiap world. Isi World4 & World5 kalau sudah tahu
+        -- (atau berdiri di titik spawn lalu pakai tombol "Simpan posisi boss" di GUI).
+        pos = {
+            World1 = Vector3.new(-99, -23, -312),
+            World2 = Vector3.new(69, -81, 4617),
+            World3 = Vector3.new(-24, -6, 9714),
+            -- World4 = Vector3.new(0, 0, 0),
+            -- World5 = Vector3.new(0, 0, 0),
+        },
+        teleportTimeout = 60,   -- detik menunggu pindah world selesai (loading lama)
+        arriveDelay = 2,        -- detik jeda setelah tiba di world baru
+        findTimeout = 10,       -- detik mencari boss di folder Enemy setelah tiba di titik spawn
+        noHpTimeout = 40,       -- detik HP boss tidak berubah -> menyerah
+        maxFight = 900,         -- batas total detik melawan satu boss
+        dungeonGuard = 60,      -- jangan mulai perjalanan boss kalau dungeon (auto join) dibuka dalam sekian detik
+        followDistance = 10,
+        offset = Vector3.new(0, 0, 3),
+        pendingTtl = 1200,      -- pengumuman boss dianggap basi setelah sekian detik
+    },
+}
+
+-- require modul game dengan cache (aman kalau gagal)
+function boss.require(parentName, name)
+    local key = parentName .. "." .. name
+    if boss.mods[key] then return boss.mods[key] end
+    if boss.failAt[key] and os.clock() - boss.failAt[key] < 10 then return nil end
+    local folder = game:GetService("ReplicatedStorage"):FindFirstChild(parentName)
+    local m = folder and folder:FindFirstChild(name)
+    if not m then return nil end
+    local ok, result = pcall(require, m)
+    if ok and result then
+        boss.mods[key] = result
+        return result
+    end
+    boss.failAt[key] = os.clock()
+    return nil
+end
+
+-- World saat ini ("World1".."World5") dari data game (State.GetData().LastArea)
+function boss.getWorld()
+    local State = boss.require("Client", "State")
+    if State then
+        local ok, data = pcall(function() return State.GetData() end)
+        if ok and type(data) == "table" and type(data.LastArea) == "string" then
+            return data.LastArea
+        end
+    end
+    return nil
+end
 
 ----------------------------------------------------------------
 -- PENGATURAN (boleh diubah)
@@ -30,7 +99,8 @@ local DEFAULT_TIMEOUT = 20        -- detik, pindah paksa kalau jumlah mob tidak 
 local DEFAULT_RADIUS = 50         -- stud, hanya mob bernama sama yang jaraknya segini dari titik save yang dihitung (bisa diubah di GUI)
 
 local function getEnemyFolder()
-    local world = workspace:FindFirstChild("World1")
+    -- folder Enemy dari world tempat kamu berada sekarang (cadangan: World1)
+    local world = workspace:FindFirstChild(boss.getWorld() or "World1") or workspace:FindFirstChild("World1")
     return world and world:FindFirstChild("Enemy")
 end
 
@@ -378,11 +448,15 @@ local minBtn = makeTitleButton("-", -66, Color3.fromRGB(230, 170, 40))
 local closeBtn = makeTitleButton("X", -34, Color3.fromRGB(210, 60, 60))
 
 -- Semua isi GUI ada di sini (supaya gampang di-minimize)
-local content = Instance.new("Frame")
+local content = Instance.new("ScrollingFrame")
 content.Name = "Content"
 content.Position = UDim2.new(0, 0, 0, 32)
 content.Size = UDim2.new(1, 0, 1, -32)
 content.BackgroundTransparency = 1
+content.BorderSizePixel = 0
+content.ScrollBarThickness = 4
+content.ScrollingDirection = Enum.ScrollingDirection.Y
+content.CanvasSize = UDim2.new(0, 0, 0, 650) -- lebih panjang dari layar: geser ke bawah untuk Auto Godly Boss
 content.Parent = main
 
 local function makeLabel(text, y)
@@ -903,9 +977,9 @@ local function stopAuto()
 end
 
 local function startAuto()
-    if dungeonLock then
-        farmWasRunning = true -- akan jalan otomatis setelah dungeon selesai
-        setStatus("ditahan: sedang dungeon, lanjut otomatis setelah selesai")
+    if dungeonLock or boss.active then
+        farmWasRunning = true -- akan jalan otomatis setelah dungeon / godly boss selesai
+        setStatus("ditahan: sedang dungeon / godly boss, lanjut otomatis setelah selesai")
         return
     end
     local order = dd2.getOrder()
@@ -1369,7 +1443,7 @@ end
 
 local function resumeFarmAfterDungeon()
     dungeonLock = false
-    if farmWasRunning then
+    if farmWasRunning and not boss.active then
         farmWasRunning = false
         startAuto()
     end
@@ -2061,10 +2135,431 @@ gui.Destroying:Connect(function()
     dungeonMob.enabled = false
     dungeonMob.running = false
     dungeonMob.token += 1
+    boss.enabled = false
+    boss.active = false
+    boss.token += 1
     for _, c in ipairs(dungeonConns) do c:Disconnect() end
     running = false
     runToken += 1
     StopAntiAFK()
+end)
+
+----------------------------------------------------------------
+-- AUTO GODLY BOSS (prioritas: dungeon > godly boss > auto farm)
+----------------------------------------------------------------
+-- Daftar godly boss diambil dari WorldConfig game (otomatis ikut bertambah kalau ada world baru)
+function boss.buildList()
+    local WC = boss.require("ModuleScripts", "WorldConfig")
+    local WN = boss.require("ModuleScripts", "WorldNames")
+    local list = {}
+
+    if WC and WC.Order and WC.Worlds then
+        for _, w in ipairs(WC.Order) do
+            local info = WC.Worlds[w]
+            local nm = info and info.Enemies and info.Enemies.Godly
+            if nm then
+                local display = (WN and WN.Get and WN.Get(w)) or (info.DisplayName) or w
+                table.insert(list, { name = nm, world = w, display = display })
+            end
+        end
+    end
+
+    if #list == 0 then -- cadangan kalau modul tidak bisa dibaca
+        list = {
+            { name = "Shanks", world = "World1", display = "Windmill Village" },
+            { name = "Kaguyi", world = "World2", display = "Leaf Village" },
+            { name = "Yorochi", world = "World3", display = "Wisteria Forest" },
+            { name = "Kusuke", world = "World4", display = "Soul Society" },
+            { name = "Brody", world = "World5", display = "Planet Namek" },
+        }
+    end
+
+    boss.list, boss.byName, boss.byLabel = list, {}, {}
+    for _, e in ipairs(list) do
+        e.label = string.format("%s (%s)", e.name, e.display)
+        boss.byName[e.name] = e
+        boss.byLabel[e.label] = e
+    end
+end
+boss.buildList()
+
+-- Pengumuman dari game: "<Boss> has appeared in <World>!" / "<Boss> has been defeated in <World>!"
+function boss.onMessage(text)
+    if type(text) ~= "string" then return end
+    local clean = text:gsub("<[^>]*>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+    -- chat dan banner mengirim pesan yang sama: abaikan kembaran dalam 10 detik
+    local now = os.clock()
+    if boss.seen[clean] and now - boss.seen[clean] < 10 then return end
+    boss.seen[clean] = now
+
+    local kind
+    if string.find(clean, "has appeared in", 1, true) then
+        kind = "appeared"
+    elseif string.find(clean, "has been defeated in", 1, true) then
+        kind = "defeated"
+    else
+        return
+    end
+
+    for _, e in ipairs(boss.list) do
+        if string.find(clean, e.name, 1, true) then
+            if kind == "appeared" then
+                boss.defeated[e.name] = nil
+                boss.pending[e.name] = now
+                boss.noteUntil = now + 5
+                boss.status = string.format("%s muncul di %s", e.name, e.display)
+            else
+                boss.pending[e.name] = nil
+                boss.defeated[e.name] = now
+                boss.noteUntil = now + 5
+                boss.status = string.format("%s sudah dikalahkan", e.name)
+            end
+            return
+        end
+    end
+end
+
+task.spawn(function()
+    local remotes = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
+    if not remotes then return end
+    for _, rn in ipairs({ "GlobalMessageAnnouncement", "PublishServerAnnouncement", "GlobalAnnouncement" }) do
+        local r = remotes:FindFirstChild(rn)
+        if r and r:IsA("RemoteEvent") then
+            table.insert(dungeonConns, r.OnClientEvent:Connect(function(text)
+                boss.onMessage(text)
+            end))
+        end
+    end
+end)
+
+-- Pindah world lewat game (tidak bisa instan lewat CFrame)
+function boss.requestWorld(w)
+    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local wf = remotes and remotes:FindFirstChild("World")
+    local r = wf and wf:FindFirstChild("RequestTeleport")
+    if r then
+        pcall(function() r:FireServer(w) end)
+        return true
+    end
+    return false
+end
+
+-- Dungeon punya prioritas pertama
+function boss.dungeonBusy()
+    if dungeon.phase ~= "idle" or dungeon.manual then return true end
+    if dungeon.enabled then
+        local t = serverNow()
+        local interval = DUNGEON_INTERVAL_MIN * 60
+        local base = math.floor((t - dungeon.offset) / interval) * interval + dungeon.offset
+        if base + interval - t <= boss.cfg.dungeonGuard or t - base < JOIN_GRACE then
+            return true
+        end
+    end
+    return false
+end
+
+function boss.waitFree(valid)
+    while valid() and boss.dungeonBusy() do
+        boss.status = "menunggu dungeon selesai (prioritas dungeon)"
+        task.wait(0.25)
+    end
+end
+
+-- Pindah ke world w. Mengembalikan true kalau sudah tiba.
+function boss.travel(w, valid)
+    if boss.getWorld() == w then return true end
+    boss.status = "teleport ke " .. w .. " (loading)..."
+    if not boss.requestWorld(w) then return false end
+
+    local t0 = os.clock()
+    while valid() and os.clock() - t0 < boss.cfg.teleportTimeout do
+        local cur = boss.getWorld()
+        local folderReady = (cur == nil) and os.clock() - t0 > 5
+            and workspace:FindFirstChild(w) ~= nil and workspace[w]:FindFirstChild("Enemy") ~= nil
+        if cur == w or folderReady then
+            local t1 = os.clock()
+            while valid() and not getRoot() and os.clock() - t1 < 10 do task.wait(0.2) end
+            task.wait(boss.cfg.arriveDelay)
+            return true
+        end
+        task.wait(0.25)
+    end
+    return false
+end
+
+function boss.findBoss(e)
+    local world = workspace:FindFirstChild(e.world)
+    local folder = world and world:FindFirstChild("Enemy")
+    if not folder then return nil end
+    local m = folder:FindFirstChild(e.name, true)
+    if m and m:IsA("Model") and isAlive(m) then return m end
+    return nil
+end
+
+-- Pilih boss pending sesuai urutan pilihan di dropdown
+function boss.pickPending()
+    local now = os.clock()
+    for name, t in pairs(boss.pending) do
+        if now - t > boss.cfg.pendingTtl then boss.pending[name] = nil end
+    end
+    for _, label in ipairs(boss.dd.getOrder()) do
+        local e = boss.byLabel[label]
+        if e and boss.pending[e.name] then return e end
+    end
+    return nil
+end
+
+-- Serang boss sampai mati. Mengembalikan "done" | "interrupted" | "stuck"
+function boss.fight(e, model, valid)
+    local lastHP = readHP(model)
+    local lastChange = os.clock()
+    local startFight = os.clock()
+    local first = true
+
+    while valid() and model.Parent and isAlive(model) and not boss.defeated[e.name] do
+        if boss.dungeonBusy() then return "interrupted" end
+
+        local root = getRoot()
+        if root then
+            local ok, cf = pcall(function() return model:GetPivot() end)
+            if ok then
+                local p = cf.Position
+                if first or (root.Position - p).Magnitude > boss.cfg.followDistance then
+                    root.CFrame = CFrame.new(p + boss.cfg.offset)
+                    first = false
+                end
+            end
+        end
+
+        local hp = readHP(model)
+        if hp ~= lastHP then
+            lastHP = hp
+            lastChange = os.clock()
+        end
+        if os.clock() - lastChange > boss.cfg.noHpTimeout or os.clock() - startFight > boss.cfg.maxFight then
+            return "stuck"
+        end
+
+        boss.status = "menyerang " .. e.name
+        RunService.Heartbeat:Wait()
+    end
+    return "done"
+end
+
+-- Urus satu godly boss: pindah world -> ke titik spawn -> cari boss -> serang
+function boss.handle(e, valid)
+    local w = e.world
+
+    -- world harus sudah terbuka
+    local WC = boss.require("ModuleScripts", "WorldConfig")
+    local State = boss.require("Client", "State")
+    if WC and State and WC.IsUnlocked then
+        local ok, data = pcall(function() return State.GetData() end)
+        if ok and type(data) == "table" and not WC.IsUnlocked(data, w) then
+            boss.pending[e.name] = nil
+            boss.status = string.format("%s: %s masih terkunci", e.name, e.display)
+            return
+        end
+    end
+
+    local pos = boss.savedPos[w] or boss.cfg.pos[w]
+    if not pos then
+        boss.pending[e.name] = nil
+        boss.status = string.format("%s: koordinat %s belum ada (pakai tombol Simpan posisi boss)", e.name, w)
+        return
+    end
+
+    for _ = 1, 3 do
+        if not valid() then return end
+        boss.waitFree(valid)
+        if not valid() then return end
+
+        if not boss.travel(w, valid) then
+            if valid() then
+                boss.pending[e.name] = nil
+                boss.status = string.format("%s: gagal pindah ke %s", e.name, e.display)
+            end
+            return
+        end
+        if boss.dungeonBusy() then continue end
+
+        local root = getRoot()
+        if root then root.CFrame = CFrame.new(pos) end
+
+        local model = boss.findBoss(e)
+        local t0 = os.clock()
+        while valid() and not model and os.clock() - t0 < boss.cfg.findTimeout do
+            boss.status = string.format("%s: mencari boss di %s...", e.name, e.display)
+            task.wait(0.25)
+            model = boss.findBoss(e)
+        end
+        if not valid() then return end
+        if not model then
+            boss.pending[e.name] = nil
+            boss.status = e.name .. ": tidak ditemukan (mungkin sudah dikalahkan)"
+            return
+        end
+
+        local result = boss.fight(e, model, valid)
+        if result ~= "interrupted" then
+            boss.pending[e.name] = nil
+            if valid() then
+                boss.status = (result == "stuck") and (e.name .. ": HP tidak berkurang, lanjut") or (e.name .. " selesai")
+            end
+            return
+        end
+        -- terpotong dungeon: ulangi (pindah lagi ke world boss setelah dungeon selesai)
+    end
+end
+
+function boss.runTrip()
+    boss.active = true
+    boss.token += 1
+    local my = boss.token
+
+    local function valid()
+        return boss.active and boss.token == my and boss.enabled
+    end
+
+    if running then
+        farmWasRunning = true
+        stopAuto()
+    end
+    setStatus("dijeda: godly boss")
+
+    task.spawn(function()
+        local home = boss.getWorld()
+
+        while valid() do
+            local e = boss.pickPending()
+            if not e then break end
+            boss.handle(e, valid)
+        end
+
+        -- kembali ke world asal supaya Auto Farm lanjut di tempat yang benar
+        if boss.token == my and home and boss.getWorld() ~= home then
+            boss.travel(home, function() return boss.token == my end)
+        end
+
+        if boss.token == my then
+            boss.active = false
+            if farmWasRunning and not dungeonLock then
+                farmWasRunning = false
+                startAuto()
+            end
+        end
+    end)
+end
+
+function boss.tick()
+    if not boss.enabled or boss.active then return end
+
+    local e = boss.pickPending()
+    if not e then
+        if os.clock() > boss.noteUntil then boss.status = "menunggu godly boss muncul" end
+        return
+    end
+    if boss.dungeonBusy() then
+        boss.status = e.name .. " muncul, menunggu dungeon selesai"
+        return
+    end
+    boss.runTrip()
+end
+
+----------------------------------------------------------------
+-- UI Auto Godly Boss (di bagian bawah tab Auto Farm, geser ke bawah)
+----------------------------------------------------------------
+do
+    mkLabel(content, "Auto Godly Boss", 8, 468, 324, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+
+    boss.dd = createDropdown(490, "Pilih godly boss...", true, true, content)
+    do
+        local labels = {}
+        for _, e in ipairs(boss.list) do table.insert(labels, e.label) end
+        boss.dd.setItems(labels)
+    end
+
+    -- Checkbox on/off
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 44)
+    row.Position = UDim2.new(0, 8, 0, 526)
+    row.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+    row.BorderSizePixel = 0
+    row.Parent = content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+    local box = Instance.new("TextButton")
+    box.Size = UDim2.new(0, 28, 0, 28)
+    box.Position = UDim2.new(0, 12, 0.5, -14)
+    box.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    box.Text = ""
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.GothamBold
+    box.TextSize = 18
+    box.AutoButtonColor = false
+    box.Parent = row
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 2
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Color = Color3.fromRGB(110, 110, 125)
+    stroke.Parent = box
+
+    mkLabel(row, "Auto Godly Boss", 52, 5, 250, 20, 14, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+    mkLabel(row, "Teleport ke boss yang dipilih saat muncul", 52, 24, 260, 18, 11, Color3.fromRGB(150, 150, 165))
+
+    local function refresh()
+        if boss.enabled then
+            box.Text = "✔"
+            box.BackgroundColor3 = Color3.fromRGB(50, 170, 90)
+            stroke.Color = Color3.fromRGB(50, 170, 90)
+        else
+            box.Text = ""
+            box.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+            stroke.Color = Color3.fromRGB(110, 110, 125)
+        end
+    end
+
+    box.MouseButton1Click:Connect(function()
+        boss.enabled = not boss.enabled
+        if boss.enabled then boss.status = "menunggu godly boss muncul" end
+        refresh()
+    end)
+
+    -- Simpan posisi spawn boss untuk world tempat kamu berada sekarang
+    local saveBtn = makeButton("Simpan posisi boss (world saat ini)", 8, 576, 324, 28, Color3.fromRGB(90, 90, 105))
+    saveBtn.TextSize = 12
+    saveBtn.MouseButton1Click:Connect(function()
+        local w = boss.getWorld()
+        local root = getRoot()
+        if not (w and root) then
+            boss.status = "world / karakter tidak terbaca"
+        else
+            local p = root.Position
+            boss.savedPos[w] = p
+            boss.status = string.format("posisi boss %s disimpan: Vector3.new(%.0f, %.0f, %.0f)", w, p.X, p.Y, p.Z)
+        end
+        boss.noteUntil = os.clock() + 8
+    end)
+
+    boss.lbl = mkLabel(content, "", 8, 610, 324, 32, 11, Color3.fromRGB(200, 200, 210))
+end
+
+task.spawn(function()
+    while gui.Parent do
+        pcall(boss.tick)
+        if boss.lbl then
+            local txt
+            if not boss.enabled then
+                txt = (boss.status ~= "" and os.clock() < boss.noteUntil) and ("Auto Godly Boss: " .. boss.status) or "Auto Godly Boss: nonaktif"
+            else
+                txt = "Auto Godly Boss: " .. (boss.status ~= "" and boss.status or "menunggu godly boss muncul")
+            end
+            if boss.lbl.Text ~= txt then boss.lbl.Text = txt end
+        end
+        task.wait(0.25)
+    end
 end)
 
 ----------------------------------------------------------------
