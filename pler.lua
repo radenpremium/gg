@@ -19,6 +19,8 @@ local player = Players.LocalPlayer
 -- ===== Godly boss: state & pembantu dunia (fungsi lain diisi di bagian bawah script) =====
 local boss = {
     enabled = false,     -- checkbox Auto Godly Boss
+    returnBack = true,   -- checkbox Teleport Back ke posisi terakhir setelah boss mati
+    last = nil,          -- posisi terakhir auto farm: { world = "World1", cf = CFrame }
     active = false,      -- true selama perjalanan godly boss berlangsung (Auto Farm ditahan)
     token = 0,
     pending = {},        -- [namaBoss] = waktu pengumuman (os.clock)
@@ -73,7 +75,9 @@ function boss.require(parentName, name)
     return nil
 end
 
--- World saat ini ("World1".."World5") dari data game (State.GetData().LastArea)
+-- World saat ini ("World1".."World5"): dari data game (State.GetData().LastArea).
+-- Cadangan kalau State tidak terbaca: world yang folder Map/Machines-nya sedang dimuat
+-- (hanya dipakai kalau tepat satu world yang cocok, supaya tidak salah tebak).
 function boss.getWorld()
     local State = boss.require("Client", "State")
     if State then
@@ -82,6 +86,16 @@ function boss.getWorld()
             return data.LastArea
         end
     end
+
+    local found, count = nil, 0
+    for _, e in ipairs(boss.list) do
+        local wf = workspace:FindFirstChild(e.world)
+        if wf and (wf:FindFirstChild("Map") or wf:FindFirstChild("Machines")) then
+            found = e.world
+            count += 1
+        end
+    end
+    if count == 1 then return found end
     return nil
 end
 
@@ -456,7 +470,7 @@ content.BackgroundTransparency = 1
 content.BorderSizePixel = 0
 content.ScrollBarThickness = 4
 content.ScrollingDirection = Enum.ScrollingDirection.Y
-content.CanvasSize = UDim2.new(0, 0, 0, 650) -- lebih panjang dari layar: geser ke bawah untuk Auto Godly Boss
+content.CanvasSize = UDim2.new(0, 0, 0, 710) -- lebih panjang dari layar: geser ke bawah untuk Auto Godly Boss
 content.Parent = main
 
 local function makeLabel(text, y)
@@ -2375,6 +2389,11 @@ function boss.handle(e, valid)
         boss.waitFree(valid)
         if not valid() then return end
 
+        -- world sama dengan karakter sekarang: tidak perlu teleport remote, langsung ke koordinat
+        if boss.getWorld() == w then
+            boss.status = string.format("%s: world sama (%s), langsung ke koordinat", e.name, e.display)
+        end
+
         if not boss.travel(w, valid) then
             if valid() then
                 boss.pending[e.name] = nil
@@ -2421,6 +2440,19 @@ function boss.runTrip()
     local function valid()
         return boss.active and boss.token == my and boss.enabled
     end
+    -- tetap benar walau checkbox dimatikan di tengah jalan (supaya tetap bisa kembali)
+    local function tripOn()
+        return boss.active and boss.token == my
+    end
+
+    -- simpan posisi terakhir auto farm (world + koordinat) sebelum berangkat
+    local root = getRoot()
+    boss.last = { world = boss.getWorld(), cf = root and root.CFrame or nil }
+    if boss.last.cf then
+        local p = boss.last.cf.Position
+        boss.status = string.format("posisi terakhir disimpan: %s (%.0f, %.0f, %.0f)",
+            boss.last.world or "?", p.X, p.Y, p.Z)
+    end
 
     if running then
         farmWasRunning = true
@@ -2429,24 +2461,45 @@ function boss.runTrip()
     setStatus("dijeda: godly boss")
 
     task.spawn(function()
-        local home = boss.getWorld()
-
         while valid() do
             local e = boss.pickPending()
             if not e then break end
             boss.handle(e, valid)
         end
 
-        -- kembali ke world asal supaya Auto Farm lanjut di tempat yang benar
-        if boss.token == my and home and boss.getWorld() ~= home then
-            boss.travel(home, function() return boss.token == my end)
+        if boss.token ~= my then return end
+
+        -- kembali ke posisi terakhir auto farm
+        local last = boss.last
+        local backOk = true
+        if boss.returnBack and last and last.world then
+            boss.waitFree(tripOn)
+            -- 1) kembali ke world auto farm lewat remote (hanya kalau beda world)
+            if boss.getWorld() ~= last.world then
+                backOk = boss.travel(last.world, tripOn)
+            end
+            -- 2) lalu teleport ke koordinat terakhir
+            if backOk and tripOn() and last.cf then
+                local r = getRoot()
+                if r then r.CFrame = last.cf end
+                boss.status = "kembali ke posisi terakhir auto farm"
+            end
         end
 
-        if boss.token == my then
-            boss.active = false
-            if farmWasRunning and not dungeonLock then
-                farmWasRunning = false
+        if boss.token ~= my then return end
+        boss.active = false
+
+        -- Auto Farm hanya dilanjutkan kalau kamu berada di world auto farm
+        if farmWasRunning and not dungeonLock then
+            local curWorld = boss.getWorld()
+            local inFarmWorld = (not last) or (not last.world) or (curWorld == last.world)
+            farmWasRunning = false
+            if backOk and inFarmWorld then
                 startAuto()
+            else
+                boss.status = "auto farm tidak dilanjutkan: kamu tidak di world auto farm, nyalakan manual"
+                boss.noteUntil = os.clock() + 20
+                setStatus("berhenti (tidak di world auto farm)")
             end
         end
     end)
@@ -2527,8 +2580,55 @@ do
         refresh()
     end)
 
+    -- Checkbox Teleport Back ke posisi terakhir (default aktif)
+    local row2 = Instance.new("Frame")
+    row2.Size = UDim2.new(1, -16, 0, 44)
+    row2.Position = UDim2.new(0, 8, 0, 576)
+    row2.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+    row2.BorderSizePixel = 0
+    row2.Parent = content
+    Instance.new("UICorner", row2).CornerRadius = UDim.new(0, 8)
+
+    local box2 = Instance.new("TextButton")
+    box2.Size = UDim2.new(0, 28, 0, 28)
+    box2.Position = UDim2.new(0, 12, 0.5, -14)
+    box2.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    box2.Text = ""
+    box2.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box2.Font = Enum.Font.GothamBold
+    box2.TextSize = 18
+    box2.AutoButtonColor = false
+    box2.Parent = row2
+    Instance.new("UICorner", box2).CornerRadius = UDim.new(0, 6)
+    local stroke2 = Instance.new("UIStroke")
+    stroke2.Thickness = 2
+    stroke2.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke2.Color = Color3.fromRGB(110, 110, 125)
+    stroke2.Parent = box2
+
+    mkLabel(row2, "Teleport Back ke Posisi Terakhir", 52, 5, 262, 20, 13, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+    mkLabel(row2, "Setelah boss mati: kembali ke world & posisi farm", 52, 24, 262, 18, 11, Color3.fromRGB(150, 150, 165))
+
+    local function refresh2()
+        if boss.returnBack then
+            box2.Text = "✔"
+            box2.BackgroundColor3 = Color3.fromRGB(50, 170, 90)
+            stroke2.Color = Color3.fromRGB(50, 170, 90)
+        else
+            box2.Text = ""
+            box2.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+            stroke2.Color = Color3.fromRGB(110, 110, 125)
+        end
+    end
+    refresh2()
+
+    box2.MouseButton1Click:Connect(function()
+        boss.returnBack = not boss.returnBack
+        refresh2()
+    end)
+
     -- Simpan posisi spawn boss untuk world tempat kamu berada sekarang
-    local saveBtn = makeButton("Simpan posisi boss (world saat ini)", 8, 576, 324, 28, Color3.fromRGB(90, 90, 105))
+    local saveBtn = makeButton("Simpan posisi boss (world saat ini)", 8, 626, 324, 28, Color3.fromRGB(90, 90, 105))
     saveBtn.TextSize = 12
     saveBtn.MouseButton1Click:Connect(function()
         local w = boss.getWorld()
@@ -2543,7 +2643,7 @@ do
         boss.noteUntil = os.clock() + 8
     end)
 
-    boss.lbl = mkLabel(content, "", 8, 610, 324, 32, 11, Color3.fromRGB(200, 200, 210))
+    boss.lbl = mkLabel(content, "", 8, 660, 324, 32, 11, Color3.fromRGB(200, 200, 210))
 end
 
 task.spawn(function()
